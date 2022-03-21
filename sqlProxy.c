@@ -32,12 +32,13 @@ int BindPort(const char *port, int direction){
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_PASSIVE;
+    
     status = getaddrinfo(NULL, port, &hints, &servinfo);
     if (status !=0){
         fprintf(stderr, "getaddrinfo error: %s\n", gai_strerror(status));
-        exit(1);
+        return -1;
     }
-
+    
     for(servinfo; servinfo != NULL; servinfo = servinfo->ai_next){
         sock_fd = socket(servinfo->ai_family, servinfo->ai_socktype, servinfo->ai_protocol);
         if(sock_fd == -1){
@@ -55,10 +56,13 @@ int BindPort(const char *port, int direction){
                 perror("server: bind \n");
                 continue;
             }
+
+            
         }else if(direction == OUT){
             if(connect(sock_fd, servinfo->ai_addr, servinfo->ai_addrlen) == -1){
                 close(sock_fd);
                 perror("connection error");
+                continue;
             }
         }
 
@@ -67,12 +71,12 @@ int BindPort(const char *port, int direction){
     if(direction == IN){
         if(servinfo == NULL){
             fprintf(stderr, "server: failed to bind\n");
-            exit(1);
+            return -1;
         }
     }else if(direction == OUT){
         if(servinfo == NULL){
             fprintf(stderr, "server: failed to connect\n");
-            exit(1); 
+            return -1; 
         }
     }
     
@@ -108,49 +112,65 @@ void DebugPrint(char *buf, int data_size){
 
 int main ()
 {
-    int sock_in_fd, server_fd, client_fd;
-    sock_in_fd = BindPort(PORT_IN, IN);
-    
-
-    if(listen(sock_in_fd, BACKLOG) == -1){
-        perror("server: listen \n");
-        exit(1);
-    }
-
+    int sock_in_fd, server_fd, client_fd, retries = 0;
     struct sockaddr_storage their_addr;
     char buf[MAXDATASIZE];
-    memset(buf, 0, sizeof buf);
-    socklen_t sin_size = sizeof their_addr;
-    client_fd = accept(sock_in_fd, (struct sockaddr *)&their_addr, &sin_size);
-    if(client_fd == -1){
+    while(1){
+        while(retries < 6){
+            sock_in_fd = BindPort(PORT_IN, IN);    
+            if(sock_in_fd == -1){
+                continue;
+            }
+
+            if(listen(sock_in_fd, BACKLOG) == -1){
+                perror("server: listen \n");
+                continue;
+            }
+
+            memset(buf, 0, sizeof buf);
+            socklen_t sin_size = sizeof their_addr;
+            client_fd = accept(sock_in_fd, (struct sockaddr *)&their_addr, &sin_size);
+            if(client_fd == -1){
+                close(client_fd);
+                perror("accept \n");
+                continue;        
+            }
+
+            char s[INET6_ADDRSTRLEN];
+            inet_ntop(their_addr.ss_family, get_in_addr((struct sockaddr *)&their_addr), s, sizeof s);
+            printf("connected from %s \n", s);
+            break;
+        }
+        retries = 0;
+        while(retries < 6){
+            server_fd = BindPort(PORT_OUT, OUT);
+            if(server_fd == -1){
+                continue;
+            }
+            break;
+        }
+        if (server_fd < 0 || client_fd <0){
+            fprintf(stderr, "connection failed \n");
+            continue;
+        }
+        int data_size = 10;
+
+        while (data_size != 0){
+
+            memset(buf, 0, sizeof buf);
+            data_size = ReSend(server_fd, client_fd, buf);
+            
+            DebugPrint(buf, data_size);
+
+            memset(buf, 0, sizeof buf);
+            data_size = ReSend(client_fd, server_fd, buf);
+
+            DebugPrint(buf, data_size);
+        }
+
+        close(sock_in_fd);
+        close(server_fd);
         close(client_fd);
-        perror("accept");
-        exit(1);        
     }
-
-    char s[INET6_ADDRSTRLEN];
-    inet_ntop(their_addr.ss_family, get_in_addr((struct sockaddr *)&their_addr), s, sizeof s);
-    printf("connected from %s \n", s);
-
-    server_fd = BindPort(PORT_OUT, OUT);
-
-    int data_size = 10;
-
-    while (data_size != 0){
-
-        memset(buf, 'A', sizeof buf);
-        data_size = ReSend(server_fd, client_fd, buf);
-        
-        DebugPrint(buf, data_size);
-
-        memset(buf, 'B', sizeof buf);
-        data_size = ReSend(client_fd, server_fd, buf);
-
-        DebugPrint(buf, data_size);
-    }
-
-    close(sock_in_fd);
-    close(server_fd);
-    close(client_fd);
     return 0;
 }
