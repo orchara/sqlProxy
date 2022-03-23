@@ -14,6 +14,7 @@
 #define IN 0
 #define OUT 1
 #define BACKLOG 10
+#define HEADSIZE 4
 #define MAXDATASIZE 200000
 
 void *get_in_addr(struct sockaddr *sa)
@@ -103,6 +104,54 @@ int ReSend(int sock_in_fd, int sock_out_fd, char *buf){
     return recv_size;
 }
 
+int NewReSend(int sock_in_fd, int sock_out_fd, char *d_buf){
+    
+    int recv_size = 1;
+    u_char header[HEADSIZE];
+    do{
+        memset(header, 0, 4);
+        recv_size = recv(sock_in_fd, header, HEADSIZE, 0);
+        printf("sock_in_fd %d \n recv_size %d \n", sock_in_fd, recv_size);
+        if(recv_size == -1){
+            close(sock_in_fd);
+            perror("recv header");
+            return -1;
+        }else if(recv_size == 0){
+            break;
+        }
+
+        uint32_t pack_size;
+        pack_size = ((uint32_t)header[0] | (uint32_t)header[1] << 8 | (uint32_t)header[2] << 16);
+        
+        d_buf = malloc(pack_size + HEADSIZE);
+        memset(d_buf, 0, (pack_size + HEADSIZE));
+        memcpy(d_buf, header, HEADSIZE);
+        char *s_buf = NULL;
+        s_buf = d_buf + HEADSIZE;
+
+        recv_size = recv(sock_in_fd, s_buf, pack_size, 0);
+        if(recv_size == -1){
+            close(sock_in_fd);
+            perror("recv");
+            exit(1);
+        }
+    
+
+        if(send(sock_out_fd, d_buf, pack_size + HEADSIZE, 0) == -1)
+        {
+            perror("send");
+            close(sock_out_fd);
+            exit(1);
+        }
+        for (int i =0; i < pack_size; i++){
+        printf("%c", s_buf[i]);
+        }
+        printf("\n");
+        free(d_buf);
+    }while(recv_size > 0);
+    return recv_size;
+}
+
 void DebugPrint(char *buf, int data_size){
     for (int i =0; i < data_size; i++){
     printf("%c", buf[i]);
@@ -115,6 +164,7 @@ int main ()
     int sock_in_fd, server_fd, client_fd, retries = 0;
     struct sockaddr_storage their_addr;
     char buf[MAXDATASIZE];
+    char *d_buf = NULL;
     while(1){
         while(retries < 6){
             sock_in_fd = BindPort(PORT_IN, IN);    
@@ -153,20 +203,28 @@ int main ()
             fprintf(stderr, "connection failed \n");
             continue;
         }
-        int data_size = 10;
+        int data_size = 0;
+        //int data_size = 10;
 
-        while (data_size != 0){
+        // while (data_size != 0){
 
-            memset(buf, 0, sizeof buf);
-            data_size = ReSend(server_fd, client_fd, buf);
+        //     memset(buf, 0, sizeof buf);
+        //     data_size = ReSend(server_fd, client_fd, buf);
             
-            DebugPrint(buf, data_size);
+        //     DebugPrint(buf, data_size);
 
-            memset(buf, 0, sizeof buf);
-            data_size = ReSend(client_fd, server_fd, buf);
+        //     memset(buf, 0, sizeof buf);
+        //     data_size = ReSend(client_fd, server_fd, buf);
 
-            DebugPrint(buf, data_size);
-        }
+        //     DebugPrint(buf, data_size);
+        // }
+
+        do {
+            data_size = NewReSend(server_fd, client_fd, d_buf);
+            data_size = NewReSend(client_fd, server_fd, d_buf);
+        }while (1);
+        
+        
 
         close(sock_in_fd);
         close(server_fd);
