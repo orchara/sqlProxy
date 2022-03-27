@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <sys/socket.h>
 #include <sys/poll.h>
 #include <netdb.h>
@@ -17,6 +18,8 @@
 #define BACKLOG 10
 #define HEADSIZE 4
 #define MAXDATASIZE 200000
+#define INF_DELAY -1
+#define ANY_PID -1
 
 void *get_in_addr(struct sockaddr *sa)
 {
@@ -44,7 +47,7 @@ int BindPort(const char *port, int direction){
     for(servinfo; servinfo != NULL; servinfo = servinfo->ai_next){
         sock_fd = socket(servinfo->ai_family, servinfo->ai_socktype, servinfo->ai_protocol);
         if(sock_fd == -1){
-            perror("server: socket \n");
+            perror("server: socket");
             continue;
         }
         // if(setsockopt(sock_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes) == -1){
@@ -55,7 +58,7 @@ int BindPort(const char *port, int direction){
         {
             if(bind(sock_fd, servinfo->ai_addr, servinfo->ai_addrlen) == -1){
                 close(sock_fd);
-                perror("server: bind \n");
+                perror("server: bind");
                 continue;
             }
 
@@ -85,24 +88,6 @@ int BindPort(const char *port, int direction){
 
     freeaddrinfo(servinfo);
     return sock_fd;
-}
-
-int ReSend(int sock_in_fd, int sock_out_fd, char *buf){
-    int recv_size;
-    recv_size = recv(sock_in_fd, buf, MAXDATASIZE-1, 0);
-    if(recv_size == -1){
-        close(sock_in_fd);
-        perror("recv");
-        exit(1);
-    }
-
-    if(send(sock_out_fd, buf, recv_size, 0) == -1)
-    {
-        perror("send");
-        close(sock_out_fd);
-        exit(1);
-    }
-    return recv_size;
 }
 
 int NewReSend(int sock_in_fd, int sock_out_fd, char *d_buf){
@@ -141,10 +126,10 @@ int NewReSend(int sock_in_fd, int sock_out_fd, char *d_buf){
         close(sock_out_fd);
         exit(1);
     }
-    for (int i = 1; i < pack_size; i++){
-    printf("%c", s_buf[i]);
-    }
-    printf("\n");
+    // for (int i = 1; i < pack_size; i++){
+    // printf("%c", s_buf[i]);
+    // }
+    // printf("\n");
     free(d_buf);
     return recv_size;
 }
@@ -160,89 +145,96 @@ int main ()
 {
     int sock_in_fd, server_fd, client_fd;
     struct sockaddr_storage their_addr;
-    char buf[MAXDATASIZE];
     char *d_buf = NULL;
-    while(1){
-
-        sock_in_fd = BindPort(PORT_IN, IN);    
-        if(sock_in_fd == -1){
-            continue;
-        }
-
-        if(listen(sock_in_fd, BACKLOG) == -1){
-            perror("server: listen \n");
-            continue;
-        }
-
-        memset(buf, 0, sizeof buf);
-        socklen_t sin_size = sizeof their_addr;
-        client_fd = accept(sock_in_fd, (struct sockaddr *)&their_addr, &sin_size);
-        if(client_fd == -1){
-            close(client_fd);
-            perror("accept \n");
-            continue;        
-        }
-
-        char s[INET6_ADDRSTRLEN];
-        inet_ntop(their_addr.ss_family, get_in_addr((struct sockaddr *)&their_addr), s, sizeof s);
-        printf("connected from %s \n", s);
-
-       
-
-        server_fd = BindPort(PORT_OUT, OUT);
-        if(server_fd == -1){
-            continue;
-        }
-
-        int data_size = 1;
-        while(data_size != 0){
-            int timeout = -1;
-            struct pollfd fds[2];
-            memset(fds, 0, sizeof(fds));
-            fds[0].fd =  server_fd;
-            fds[0].events = POLLIN;
-            fds[0].revents = 0;
-            fds[1].fd =  client_fd;
-            fds[1].events = POLLIN;
-            fds[1].revents = 0;
-            
-            if(poll(fds, 2, timeout) < 0){
-                perror("poll() failed");
-                exit(1);
-            }
-            if(fds[0].revents == POLLIN){
-                data_size = NewReSend(server_fd, client_fd, d_buf);
-                printf("\n server - client resend \n data_size = %d \n", data_size);
-            } else if(fds[1].revents == POLLIN){
-                data_size = NewReSend(client_fd, server_fd, d_buf); 
-                printf("\n client - server resend \n data_size = %d \n", data_size);
-            } else {
-                continue;
-            }
-        }
-        
-
-        //int data_size = 10;
-
-        // while (data_size != 0){
-
-        //     memset(buf, 0, sizeof buf);
-        //     data_size = ReSend(server_fd, client_fd, buf);
-            
-        //     DebugPrint(buf, data_size);
-
-        //     memset(buf, 0, sizeof buf);
-        //     data_size = ReSend(client_fd, server_fd, buf);
-
-        //     DebugPrint(buf, data_size);
-        // }
-
-        
-        
-
-        close(sock_in_fd);
-        close(server_fd);
-        close(client_fd);
+    pid_t pid;
+    
+    sock_in_fd = BindPort(PORT_IN, IN);    
+    if(sock_in_fd == -1){
+        fprintf(stderr, "Server shutting down \n");
+        exit(1);
     }
+    
+    if(listen(sock_in_fd, BACKLOG) == -1){
+        perror("server: listen \n");
+        fprintf(stderr, "Server shutting down \n");
+        exit(1);
+    }
+    while(1){
+        struct pollfd sock_fds;
+        struct pollfd *psock_fds = &sock_fds;
+        int num_fds = 0;
+        sock_fds.fd =  sock_in_fd;
+        sock_fds.events = POLLIN;
+        sock_fds.revents = 0;
+        num_fds = 1;
+
+        if(poll(psock_fds, num_fds, INF_DELAY) < 0){
+            perror("poll() failed");
+            exit(1);
+        }
+        if(sock_fds.revents == POLLIN){
+            pid = fork();
+        }
+
+        if(pid == -1){
+            perror("fork \n");
+            exit(1);
+        }else if(pid > 0){
+            waitpid(ANY_PID, NULL, WNOHANG);
+            continue;
+        }else{
+            while(1){
+                socklen_t sin_size = sizeof their_addr;
+                client_fd = accept(sock_in_fd, (struct sockaddr *)&their_addr, &sin_size);
+                if(client_fd == -1){
+                    close(client_fd);
+                    perror("accept \n");
+                    continue;        
+                }
+
+                // char s[INET6_ADDRSTRLEN];
+                // inet_ntop(their_addr.ss_family, get_in_addr((struct sockaddr *)&their_addr), s, sizeof s);
+                // printf("connected from %s \n", s);       
+
+                server_fd = BindPort(PORT_OUT, OUT);
+                if(server_fd == -1){
+                    fprintf(stderr, "Could not connect to MySQL server \nServer shutting down \n");
+                    exit(1);
+                }
+
+                int data_size = 0;
+                do{
+                    struct pollfd fds[2];
+                    memset(fds, 0, sizeof(fds));
+                    fds[0].fd =  server_fd;
+                    fds[0].events = POLLIN;
+                    fds[0].revents = 0;
+                    fds[1].fd =  client_fd;
+                    fds[1].events = POLLIN;
+                    fds[1].revents = 0;
+                    num_fds = 2;
+                    
+                    if(poll(fds, num_fds, INF_DELAY) < 0){
+                        perror("poll() failed");
+                        exit(1);
+                    }
+                    if(fds[0].revents == POLLIN){
+                        data_size = NewReSend(server_fd, client_fd, d_buf);
+                        //printf("\n server - client resend \n data_size = %d \n ------------------ \n", data_size);
+                    } else if(fds[1].revents == POLLIN){
+                        data_size = NewReSend(client_fd, server_fd, d_buf); 
+                        //printf("\n client - server resend \n data_size = %d \n ------------------ \n", data_size);
+                    } else {
+                        continue;
+                    }
+                }while(data_size != 0);
+                close(server_fd);
+                close(client_fd);
+                printf("child process exit\n");
+                exit(0);
+            }
+        }
+    }
+    close(sock_in_fd);
     return 0;
 }
