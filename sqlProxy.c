@@ -27,24 +27,26 @@
 #define FALSE 0
 #define TRUE 1
 #define HEAD_OFFSET 5
-
+#define SERVER 0
+#define CLIENT 1
 
 volatile sig_atomic_t chld_flag = FALSE, quit_flag = FALSE;
 void DebugPrint(char *buf, int data_size);
-void *get_in_addr(struct sockaddr *sa);
+void *GetInAddr(struct sockaddr *sa);
 int BindPort(const char *port, int direction);
-int ReSend(int sock_in_fd, int sock_out_fd, char **d_buf);
+int32_t ReSend(int sock_in_fd, int sock_out_fd, char **d_buf);
 int OpenLogFile(void);
+void LogWrite(int log_fd, char *buf, int32_t data_size, int8_t sender);
 
-void sigchld_handler(int sig){
+void SigchldHandler(int sig){
     chld_flag = TRUE;
 }
 
-void quit_handler(int sig){
+void QuitHhandler(int sig){
     quit_flag = TRUE;
 }
 
-void *get_in_addr(struct sockaddr *sa)
+void *GetInAddr(struct sockaddr *sa)
 {
     if(sa->sa_family == AF_INET){
         return &(((struct sockaddr_in*)sa)->sin_addr);
@@ -113,9 +115,10 @@ int BindPort(const char *port, int direction){
     return sock_fd;
 }
 
-int ReSend(int sock_in_fd, int sock_out_fd, char **d_buf){
-    int recv_size = 0;
+int32_t ReSend(int sock_in_fd, int sock_out_fd, char **d_buf){
+    int32_t recv_size = 0;
     u_char header[HEADSIZE];
+    uint32_t pack_size;
     memset(header, 0, 4);
     recv_size = recv(sock_in_fd, header, HEADSIZE, 0);
     if(recv_size == -1){
@@ -123,7 +126,7 @@ int ReSend(int sock_in_fd, int sock_out_fd, char **d_buf){
         return -1;
     }
 
-    uint32_t pack_size;
+    
     pack_size = ((uint32_t)header[0] | (uint32_t)header[1] << 8 | (uint32_t)header[2] << 16);
     
     *d_buf = malloc(pack_size + HEADSIZE);
@@ -133,8 +136,7 @@ int ReSend(int sock_in_fd, int sock_out_fd, char **d_buf){
     s_buf = *d_buf + HEADSIZE;
 
     recv_size = recv(sock_in_fd, s_buf, pack_size, 0);
-    if(recv_size == -1){
-        free(*d_buf);
+    if(recv_size == -1){        
         perror("recv");
         return -1;
     }
@@ -142,17 +144,13 @@ int ReSend(int sock_in_fd, int sock_out_fd, char **d_buf){
 
     if(send(sock_out_fd, *d_buf, pack_size + HEADSIZE, 0) == -1)
     {
-        perror("send");
-        free(*d_buf);
+        perror("send");       
         return -1;
     }
-    if((pack_size == 1) && ((*d_buf)[4] == 0x01) && (*d_buf)[3] == 0x00){ //command quit
-        //free(*d_buf);
+    if((pack_size == 1) && ((*d_buf)[4] == 0x01) && (*d_buf)[3] == 0x00){ //command quit        
         return 0;
     }
-    
-    //free(d_buf); //TODO remove this to main func
-    return recv_size;
+    return pack_size + HEADSIZE;
 }
 
 void DebugPrint(char *buf, int data_size){
@@ -167,12 +165,14 @@ int OpenLogFile(void){
     int flags, fd;
     flags = O_CREAT | O_EXCL | O_WRONLY;
     mode = S_IRWXU | S_IRWXG | S_IROTH; // доcтуп 774
-    char pathname[33];
     long int s_time;
     struct tm *m_time;
     s_time = time(NULL);
     m_time = localtime(&s_time);
-    strftime(pathname, 33, "./logs/log_%y-%m-%d_%H-%M-%S.txt", m_time);
+    const char path[] = "./logs/log_%y-%m-%d_%H-%M-%S.txt";
+    //const char path[] = "./logs/test";
+    char pathname[(strlen(path)+1)];
+    strftime(pathname, (strlen(path)+1), path, m_time);
 
     if(mkdir("./logs", mode) < 0 && (errno != EEXIST)){
         perror("mkdir");
@@ -186,7 +186,26 @@ int OpenLogFile(void){
     return fd;
 }
 
-int main ()
+void LogWrite(int log_fd, char *buf, int32_t data_size, int8_t sender){    
+    int32_t wr_size = 0;
+    if(lockf(log_fd, F_LOCK, data_size) < 0){
+        perror("block error");
+        exit(1);
+    }
+    write(log_fd, &sender, 1);
+    while(data_size > 0){
+        data_size = data_size - wr_size;
+        buf = buf + wr_size;        
+        wr_size = write(log_fd, buf, data_size);
+        if(wr_size < 0){
+            perror("write to log file error");
+            exit(1);                                
+        }
+    }
+    lockf(log_fd, F_ULOCK, 0);
+}
+
+int main (void)
 {
     int sock_in_fd, log_fd;
     pid_t m_pid = getpid();
@@ -196,9 +215,9 @@ int main ()
     sigemptyset(&set);
     sigaddset(&set, SIGCHLD);
     sigaddset(&set, SIGINT);
-    child_sa.sa_handler = sigchld_handler;
+    child_sa.sa_handler = SigchldHandler;
     child_sa.sa_mask = set;
-    quit_sa.sa_handler = quit_handler;
+    quit_sa.sa_handler = QuitHhandler;
     quit_sa.sa_mask = set;
     if(sigaction(SIGINT, &quit_sa, 0) == -1){
         perror("sigaction quit");
@@ -272,10 +291,9 @@ int main ()
                 perror("fork");
                 exit(1);
             }else if(pid == 0){          //child process  
-                int32_t data_size = 0, wr_size = 0;
+                int32_t data_size = 0;
                 int poll_chk;
                 char *d_buf = NULL;
-                char *w_buf = NULL;
                 struct pollfd fds[2];
                 close(sock_in_fd); 
                 do{
@@ -308,41 +326,11 @@ int main ()
                         }else if (poll_chk > 0){
                             if(fds[0].revents == POLLIN){                                
                                 data_size = ReSend(server_fd, client_fd, &d_buf);
-                                int32_t w_data_size = data_size - HEAD_OFFSET;
-                                w_buf = d_buf+HEAD_OFFSET;
-                                if(lockf(log_fd, F_LOCK, data_size) < 0){
-                                    perror("block error");
-                                    exit(1);
-                                }
-                                while(w_data_size > 0){
-                                    wr_size = write(log_fd, w_buf, data_size);
-                                    if(wr_size < 0){
-                                        perror("write to log file error");
-                                        exit(1);                                
-                                    }
-                                    w_data_size = w_data_size - wr_size;
-                                    
-                                }
-                                lockf(log_fd, F_ULOCK, 0);
+                                LogWrite(log_fd, d_buf, data_size, SERVER);
                                 free(d_buf);
                             } else if(fds[1].revents == POLLIN){                                
                                 data_size = ReSend(client_fd, server_fd, &d_buf); 
-                                int32_t w_data_size = data_size - HEAD_OFFSET;
-                                w_buf = d_buf+HEAD_OFFSET;
-                                if(lockf(log_fd, F_LOCK, data_size) < 0){
-                                    perror("block error");
-                                    exit(1);
-                                }
-                                while(w_data_size > 0){
-                                    wr_size = write(log_fd, w_buf, data_size);
-                                    if(wr_size < 0){
-                                        perror("write to log file error");
-                                        exit(1);                                
-                                    }
-                                    w_data_size = w_data_size - wr_size;
-                                    
-                                }
-                                lockf(log_fd, F_ULOCK, 0);
+                                LogWrite(log_fd, d_buf, data_size, CLIENT);
                                 free(d_buf);
                             } 
                         }
