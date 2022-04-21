@@ -115,7 +115,7 @@ int BindPort(const char *port, int direction){
     return sock_fd;
 }
 
-int32_t ReSend(int sock_in_fd, int sock_out_fd, char **d_buf){
+int32_t ReSend(int sock_in_fd, int sock_out_fd, char **d_buf){  //TODO add a resending size control
     int32_t recv_size = 0;
     u_char header[HEADSIZE];
     uint32_t pack_size;

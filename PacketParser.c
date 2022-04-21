@@ -6,6 +6,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <stddef.h>
 
 #define P_LENGTH_SIZE 3
 #define SEQ_ID_SIZE 1
@@ -14,6 +15,14 @@
 #define PACKET_HEADER 5
 #define HANDSHAKEV10 0x0a
 #define NAME_OFFSET 32
+#define MAX_LENGTH_AP_DATA 21
+#define LENGTH_AP_DATA_1 8
+#define HS_RESERVED 10
+
+
+//Capability Flags
+#define CLIENT_PLUGIN_AUTH 0x00080000
+#define CLIENT_SECURE_CONNECTION 0x00008000
 
 
 struct command ComQueryRead();
@@ -28,21 +37,18 @@ struct sql_packet
     u_char *playload;
 
 };
+
 #pragma pack(push, 1)
 typedef struct sql_packet_bit
 {
     __uint8_t sender;                   
     __uint32_t playload_length : 24;     
     __uint8_t sequence_id;              
-    u_char pad[3];
+    u_char pad[3];  //TODO задать расчет заполнителя через sizeof/offsetof
     u_char *playload;
 
 }sql_packet_bit;
 #pragma pack(pop)
-
-
-
-
 
 struct command
 {
@@ -84,6 +90,21 @@ ssize_t Read(int fd, void *buf, size_t size_buf_element, size_t count){
         }
     }
 }
+
+/*Wrapper for VOID MALLOC(size_t __size)
+*with NULL pointer check, error exit
+ and ZERO memset*/
+void *Malloc(size_t size){
+    void *ptr = malloc(size);
+    if (ptr == NULL){
+        perror("malloc error");
+        exit(1);
+    }else{
+        memset(ptr, 0, size);
+        return ptr;
+    }
+}
+
 /*Count and return length of string[NUL]
 *from body of sql packet
 **STRING - is pointer to playload buf
@@ -125,16 +146,83 @@ int main(void)
     //в лог выводим имя пользователя и время коннекта
     ///login sequence
     sql_packet_bit pack;
-    struct hand_shake_v10
+    #pragma pack(push, 1)
+    typedef struct hand_shake_v10               //Server greeting(Handshake pack)
     {
         u_int8_t protocol_version;
-    } hs_pack;
+                                        //u_char *server_version;
+        u_int32_t connection_id;
+        u_char auth_plugin_data_p1[LENGTH_AP_DATA_1+sizeof(char)];
+        u_int16_t capability_flags_1;
+        //if more data in the packet:
+        u_int8_t character_set;
+        u_int16_t status_flags;
+        u_int16_t capability_flags_2;
+        //if capabilities & CLIENT_PLUGIN_AUTH
+        u_int8_t length_auth_p_data; //else filler == 0x00
+        u_char reserved[HS_RESERVED];
+        //if capabilities & CLIENT_SECURE_CONNECTION
+        u_char auth_plugin_data_p2[MAX_LENGTH_AP_DATA-LENGTH_AP_DATA_1]; //max length is 13
+        u_char *server_version;
+        //if capabilities & CLIENT_PLUGIN_AUTH
+        u_char *auth_plugin_name;
+    }h_s_v10;
+    #pragma pack(pop)
+    h_s_v10 hs_pack;
+    u_int32_t read_offset = 0, read_size = 0;
+    memset(&hs_pack,0,sizeof(hs_pack));
+    ReadPacket(fd, &pack);  
+    char *p_hs_pack = (char *)&hs_pack;        
+    p_hs_pack[offsetof(h_s_v10, protocol_version)] = pack.playload[read_offset];                //protocol version
+    read_offset += sizeof(hs_pack.protocol_version);
+    if(hs_pack.protocol_version == HANDSHAKEV10){   // handler for handshake protocol v 10
+        read_size = NullStringLength(pack.playload, read_offset);
+        hs_pack.server_version = Malloc(read_size); 
+        memcpy(hs_pack.server_version, (pack.playload + read_offset), read_size);
+        u_int32_t req_field_length = sizeof(hs_pack.protocol_version) + 
+                                     read_size +       //length of server version
+                                     sizeof(hs_pack.connection_id) + 
+                                     sizeof(hs_pack.auth_plugin_data_p1);
+        if(pack.playload_length > req_field_length)
+        {
+            read_offset += read_size;
+            read_size = sizeof(hs_pack.connection_id) + 
+                        sizeof(hs_pack.auth_plugin_data_p1) + 
+                        sizeof(hs_pack.capability_flags_1) +
+                        sizeof(hs_pack.character_set) +
+                        sizeof(hs_pack.status_flags) +
+                        sizeof(hs_pack.capability_flags_2);
+            memcpy((p_hs_pack + offsetof(h_s_v10, connection_id)), 
+                   (pack.playload + read_offset),
+                    read_size);
+            read_offset += read_size;
+            u_int32_t capabilities;
+            memcpy((char *)&capabilities, 
+                    p_hs_pack + offsetof(h_s_v10,capability_flags_1), 
+                    sizeof(hs_pack.capability_flags_1));
+            memcpy(((char *)&capabilities) + sizeof(hs_pack.capability_flags_1), 
+                    p_hs_pack + offsetof(h_s_v10,capability_flags_2), 
+                    sizeof(hs_pack.capability_flags_2)); 
+            //capabilities check
+            if(capabilities & CLIENT_PLUGIN_AUTH){
+                printf("cli plug yes\n");
+            }
 
-    ReadPacket(fd, &pack);          //Server greeting(Handshake pack)
-    hs_pack.protocol_version = pack.playload[0];
-    if(hs_pack.protocol_version != HANDSHAKEV10){
+        }else{
+            read_offset += read_size;
+            read_size = sizeof(hs_pack.connection_id) + 
+                        sizeof(hs_pack.auth_plugin_data_p1);
+            memcpy((p_hs_pack + offsetof(h_s_v10, connection_id)), 
+                   (pack.playload + read_offset),
+                    read_size);            
+        }
+        
+        
+    }else{                                          // handler for handshake protocol v 9
         printf("protocol version is %d\n this version of protocol not supported\n", hs_pack.protocol_version);
     }
+
+
     free(pack.playload);
     ReadPacket(fd,&pack);           //Login request(Handshake response)
     struct hs_response_41
@@ -158,7 +246,7 @@ int main(void)
     free(pack.playload);
 
 
-
+    free(hs_pack.server_version); //TODO find place to this
 
     // printf("read result - %d \nstring is %s\n", pack.playload_length, pack.playload);
     // free(pack.playload);    
