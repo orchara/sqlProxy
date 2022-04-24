@@ -18,6 +18,8 @@
 #define MAX_LENGTH_AP_DATA 21
 #define LENGTH_AP_DATA_1 8
 #define HS_RESERVED 10
+#define RES_RESERVED 23
+#define PACK_RESERVED 3
 
 
 //Capability Flags
@@ -28,28 +30,70 @@
 #define CLIENT_CONNECT_ATTRS 0x00100000
 
 
-
-
-
-struct sql_packet
-{
-    __uint8_t sender;
-    __uint32_t playload_length;
-    __uint8_t sequence_id;
-    u_char *playload;
-
-};
-
 #pragma pack(push, 1)
 typedef struct sql_packet_bit
 {
     __uint8_t sender;                   
     __uint32_t playload_length : 24;     
     __uint8_t sequence_id;              
-    u_char pad[3];  //TODO задать расчет заполнителя через sizeof/offsetof
+    u_char reserved[PACK_RESERVED];  //TODO задать расчет заполнителя через sizeof/offsetof
     u_char *playload;
 
 }sql_packet_bit;
+#pragma pack(pop)
+
+#pragma pack(push, 1)
+typedef struct hand_shake_v10       //Server greeting(Handshake pack v10)
+{
+    u_int8_t protocol_version;
+                                    //u_char *server_version;
+    u_int32_t connection_id;
+    u_char auth_plugin_data_p1[LENGTH_AP_DATA_1];
+    u_char filler;
+    u_int16_t capability_flags_1;
+    //if more data in the packet:
+    u_int8_t character_set;
+    u_int16_t status_flags;
+    u_int16_t capability_flags_2;
+    //if capabilities & CLIENT_PLUGIN_AUTH
+    u_int8_t length_auth_p_data; //else filler == 0x00
+    u_char reserved[HS_RESERVED];
+    //if capabilities & CLIENT_SECURE_CONNECTION
+    u_char auth_plugin_data_p2[MAX_LENGTH_AP_DATA-LENGTH_AP_DATA_1]; //max length is 13
+    u_char *server_version;
+    //if capabilities & CLIENT_PLUGIN_AUTH
+    u_char *auth_plugin_name;
+}hand_shake_v10;
+#pragma pack(pop)
+
+typedef struct client_conn_attrs{
+    char *key;
+    char *value;
+    struct client_conn_attrs *next;
+}client_conn_attrs;
+
+#pragma pack(push, 1)
+typedef struct hs_response_41           //login request (handshake response v41)
+{
+    u_int32_t capability_flags;
+    u_int32_t max_packet_size;
+    u_int8_t character_set;
+    u_char reserved[RES_RESERVED];
+    u_char *username;
+    /*if capabilities & CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA {lenenc len_auth_response}
+    ELSE if capabilities & CLIENT_SECURE_CONNECTION {1b len_auth_responce}
+    ELSE len_auth_response = 0*/
+    u_int64_t len_auth_response; 
+    u_char *auth_response;
+    //if capabilities & CLIENT_CONNECT_WITH_DB
+    u_char *database;
+    //if capabilities & CLIENT_PLUGIN_AUTH
+    u_char *auth_plugin_name;
+    //if capabilities & CLIENT_PLUGIN_ATTRS
+    u_int64_t len_key_values;
+    client_conn_attrs *conn_attrs;
+
+} hs_response_41;
 #pragma pack(pop)
 
 struct command
@@ -58,11 +102,7 @@ struct command
     void *playload;
 };
 
-typedef struct client_conn_attrs{
-    char *key;
-    char *value;
-    struct client_conn_attrs *next;
-}client_conn_attrs;
+
 
 
 void ReadPacket(int in_fd, sql_packet_bit *pack);
@@ -70,6 +110,7 @@ ssize_t Read(int fd, void *buf, size_t size_buf_element, size_t count);
 int GetLenEncInt(char *buf, int64_t *result);
 int ReadLenIncStr(char *buf, char **str);
 void *Malloc(size_t size);
+void ConnAttrsFree(client_conn_attrs *pack);
 
 struct command ComQueryRead(){
 
@@ -173,11 +214,34 @@ int NullStringLength(u_char *string, u_int32_t offset){
     return stringsize;
 }
 
+void HandshakeV10Free(hand_shake_v10 *pack){
+    free(pack->server_version);
+    free(pack->auth_plugin_name);
+    return;
+}
+
+void HSResponseFree(hs_response_41 *pack){
+    free(pack->username);
+    free(pack->auth_response);
+    free(pack->auth_plugin_name);
+    free(pack->database);
+    ConnAttrsFree(pack->conn_attrs);
+
+}
+
+void ConnAttrsFree(client_conn_attrs *pack){
+    client_conn_attrs *this = pack, *next = NULL;
+    while(this != NULL){
+        free(this->key);
+        free(this->value);
+        next = this->next;
+        free(this);
+        this = next;       
+    }    
+}
+
 int main(void)
 {   
-    //printf("%ld\n", sizeof(sql_packet_bit));
-    //printf("%ld\n", sizeof(struct command));
-
     mode_t mode;
     int flags, fd;
     flags = O_RDONLY;
@@ -193,60 +257,14 @@ int main(void)
     //отделить фазу подключения от фазы команд
         //server greeteng - server
         //login request - client
+            //or ssl request
+            //or old login request (HS_RES 320)
         //auth switch request - server
+            //or old auth switch request
         //auth switch response - client
         //response OK / err_pack
-    //в лог выводим имя пользователя и время коннекта
-    ///login sequence
     
-    #pragma pack(push, 1)
-    typedef struct hand_shake_v10               //Server greeting(Handshake pack)
-    {
-        u_int8_t protocol_version;
-                                        //u_char *server_version;
-        u_int32_t connection_id;
-        u_char auth_plugin_data_p1[LENGTH_AP_DATA_1];
-        u_char filler;
-        u_int16_t capability_flags_1;
-        //if more data in the packet:
-        u_int8_t character_set;
-        u_int16_t status_flags;
-        u_int16_t capability_flags_2;
-        //if capabilities & CLIENT_PLUGIN_AUTH
-        u_int8_t length_auth_p_data; //else filler == 0x00
-        u_char reserved[HS_RESERVED];
-        //if capabilities & CLIENT_SECURE_CONNECTION
-        u_char auth_plugin_data_p2[MAX_LENGTH_AP_DATA-LENGTH_AP_DATA_1]; //max length is 13
-        u_char *server_version;
-        //if capabilities & CLIENT_PLUGIN_AUTH
-        u_char *auth_plugin_name;
-    }hand_shake_v10;
-    #pragma pack(pop)
-
-    #pragma pack(push, 1)
-    typedef struct hs_response_41
-    {
-        u_int32_t capability_flags;
-        u_int32_t max_packet_size;
-        u_int8_t character_set;
-        u_char reserved[23];
-        u_char *username;
-        /*if capabilities & CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA {lenenc len_auth_response}
-        ELSE if capabilities & CLIENT_SECURE_CONNECTION {1b len_auth_responce}
-        ELSE len_auth_response = 0*/
-        u_int64_t len_auth_response; 
-        u_char *auth_response;
-        //if capabilities & CLIENT_CONNECT_WITH_DB
-        u_char *database;
-        //if capabilities & CLIENT_PLUGIN_AUTH
-        u_char *auth_plugin_name;
-        //if capabilities & CLIENT_PLUGIN_ATTRS
-        u_int64_t len_key_values;
-        client_conn_attrs *conn_attrs;
-
-    } hs_response_41;
-    #pragma pack(pop)
-
+    ///login sequence
     sql_packet_bit pack;
     hand_shake_v10 hs_pack;
     hs_response_41 hs_res;
@@ -289,7 +307,6 @@ int main(void)
             memcpy(((char *)&server_capabilities) + sizeof(hs_pack.capability_flags_1), 
                     p_hs_pack + offsetof(hand_shake_v10,capability_flags_2), 
                     sizeof(hs_pack.capability_flags_2)); 
-            //capabilities check
             if(server_capabilities & CLIENT_PLUGIN_AUTH){
                 p_hs_pack[offsetof(hand_shake_v10, length_auth_p_data)] = pack.playload[read_offset];
                 read_offset += sizeof(hs_pack.length_auth_p_data);
@@ -323,7 +340,8 @@ int main(void)
         printf("handshake protocol version is %d\n this version of protocol not supported\n", hs_pack.protocol_version);
     }
 
-    //Login request(Handshake response)
+    //Login request(Handshake response v41)
+    //TODO if protocol version not 41
     free(pack.playload);
     memset(&pack, 0, sizeof(pack));
     memset(&hs_res, 0, sizeof(hs_res));
@@ -405,13 +423,43 @@ int main(void)
         }
     }
 
+
+    //auth switch request
+
     free(pack.playload);
+    ReadPacket(fd, &pack);
+    read_offset = 0;
+    read_size = 0;
+    struct auth_switch_rq 
+    {   
+        u_char status;
+        char *plugin_name;
+        char *auth_plugin_data;
+    }as_req_pack;
+    as_req_pack.status = pack.playload[0];
+    read_offset += sizeof(as_req_pack.status);
+    if(as_req_pack.status == 0xfe && pack.playload_length > read_offset){
+        read_size = NullStringLength(pack.playload, read_offset);
+        as_req_pack.plugin_name = Malloc(read_size);
+        memcpy(as_req_pack.plugin_name, pack.playload + read_offset, read_size);
+        read_offset += read_size;
+        read_size = pack.playload_length - read_offset;
+        as_req_pack.auth_plugin_data = Malloc(read_size);
+        memcpy(as_req_pack.auth_plugin_data, pack.playload +read_offset, read_size);
+    }
+
+
+
+
 
     //TODO make a memfree func for all structs
-    
-    free(hs_pack.auth_plugin_name);
-    free(hs_pack.server_version); 
-    free(hs_res.username);
+    free(pack.playload);
+
+    HandshakeV10Free(&hs_pack);
+    HSResponseFree(&hs_res);
+    free(as_req_pack.auth_plugin_data);
+    free(as_req_pack.plugin_name);
+
     // printf("read result - %d \nstring is %s\n", pack.playload_length, pack.playload);
     // free(pack.playload);    
     
