@@ -19,7 +19,9 @@
 #define LENGTH_AP_DATA_1 8
 #define HS_RESERVED 10
 #define RES_RESERVED 23
-#define PACK_RESERVED 3
+#define PACK_RESERVED_OFFSET 5
+#define HSR320_RESERVED_OFFSET 5
+#define MAX_PACKET_SIZE_LENGTH 3
 
 
 //Capability Flags
@@ -38,14 +40,14 @@ typedef struct sql_packet_bit
     __uint8_t sender;                   
     __uint32_t playload_length : 24;     
     __uint8_t sequence_id;              
-    u_char reserved[PACK_RESERVED];  //TODO задать расчет заполнителя через sizeof/offsetof
+    u_char reserved[sizeof(u_char*) - (PACK_RESERVED_OFFSET % sizeof(u_char*))];
     u_char *playload;
 
 }sql_packet_bit;
 #pragma pack(pop)
 
 #pragma pack(push, 1)
-typedef struct hand_shake_v10       //Server greeting(Handshake pack v10)
+typedef struct hand_shake       //Server greeting(Handshake pack v10)
 {
     u_int8_t protocol_version;
                                     //u_char *server_version;
@@ -65,7 +67,8 @@ typedef struct hand_shake_v10       //Server greeting(Handshake pack v10)
     u_char *server_version;
     //if capabilities & CLIENT_PLUGIN_AUTH
     u_char *auth_plugin_name;
-}hand_shake_v10;
+    u_char *auth_plugin_data_full; //in protocol version 9
+}hand_shake;
 #pragma pack(pop)
 
 typedef struct client_conn_attrs{
@@ -98,6 +101,24 @@ typedef struct hs_response_41           //login request (handshake response v41)
 } hs_response_41;
 #pragma pack(pop)
 
+#pragma pack(push, 1)
+typedef struct hs_response_320{
+    u_int16_t capability_flags;
+    u_int32_t max_packet_size : 24;
+    u_char reserved[sizeof(u_char*) - (HSR320_RESERVED_OFFSET % sizeof(u_char*))];
+    u_char *username;
+    u_char *auth_response;
+    u_char *database;
+}hs_response_320;
+#pragma pack(pop)
+
+typedef struct auth_switch_rq 
+{   
+    u_int8_t status;
+    u_char *plugin_name;
+    u_char *auth_plugin_data;
+}auth_switch_rq;
+
 struct command
 {
     __uint8_t name;
@@ -113,6 +134,7 @@ int GetLenEncInt(u_char *buf, int64_t *result);
 u_int64_t ReadLenIncStr(u_char *buf, u_char **str);
 void *Malloc(size_t size);
 void ConnAttrsFree(client_conn_attrs *pack);
+void AuthSwitchRqFree(auth_switch_rq *pack);
 
 struct command ComQueryRead(){
 
@@ -243,7 +265,7 @@ u_int32_t GetNullStr(u_char *buf, u_char **str){
     return read_size;
 }
 
-void HandshakeV10Free(hand_shake_v10 *pack){
+void HandshakeV10Free(hand_shake *pack){
     free(pack->server_version);
     free(pack->auth_plugin_name);
     return;
@@ -267,6 +289,11 @@ void ConnAttrsFree(client_conn_attrs *pack){
         free(this);
         this = next;       
     }    
+}
+
+void AuthSwitchRqFree(auth_switch_rq *pack){
+    free(pack->auth_plugin_data);
+    free(pack->plugin_name);
 }
 
 int main(void)
@@ -295,17 +322,22 @@ int main(void)
     
     ///login sequence
     sql_packet_bit pack;
-    hand_shake_v10 hs_pack;
-    hs_response_41 hs_res;
+    hand_shake hs_pack;
     char *p_hs_pack = (char *)&hs_pack;
+    hs_response_320 hs_res_320;
+    hs_response_320 *p_hs_res_320 = &hs_res_320;
+    memset(&hs_res_320, 0, sizeof(hs_res_320));
+    hs_response_41 hs_res;
     char *p_hs_res = (char *)&hs_res;
+    memset(&hs_res, 0, sizeof(hs_res));
+
     u_int32_t server_capabilities;
     u_int64_t read_offset = 0, read_size = 0;
     
     memset(&pack, 0, sizeof(pack));
     memset(&hs_pack, 0, sizeof(hs_pack));
     ReadPacket(fd, &pack);          
-    p_hs_pack[offsetof(hand_shake_v10, protocol_version)] = pack.playload[read_offset];                //protocol version
+    p_hs_pack[offsetof(hand_shake, protocol_version)] = pack.playload[read_offset];                //protocol version
     read_offset += sizeof(hs_pack.protocol_version);
     if(hs_pack.protocol_version == HANDSHAKEV10){   // handler for handshake protocol v 10
         read_size = GetNullStr(pack.playload + read_offset, &hs_pack.server_version);
@@ -324,24 +356,24 @@ int main(void)
                         sizeof(hs_pack.character_set) +
                         sizeof(hs_pack.status_flags) +
                         sizeof(hs_pack.capability_flags_2);
-            memcpy((p_hs_pack + offsetof(hand_shake_v10, connection_id)), 
+            memcpy((p_hs_pack + offsetof(hand_shake, connection_id)), 
                    (pack.playload + read_offset),
                     read_size);
             read_offset += read_size;            
             memcpy((char *)&server_capabilities, 
-                    p_hs_pack + offsetof(hand_shake_v10,capability_flags_1), 
+                    p_hs_pack + offsetof(hand_shake,capability_flags_1), 
                     sizeof(hs_pack.capability_flags_1));
             memcpy(((char *)&server_capabilities) + sizeof(hs_pack.capability_flags_1), 
-                    p_hs_pack + offsetof(hand_shake_v10,capability_flags_2), 
+                    p_hs_pack + offsetof(hand_shake,capability_flags_2), 
                     sizeof(hs_pack.capability_flags_2)); 
             if(server_capabilities & CLIENT_PLUGIN_AUTH){
-                p_hs_pack[offsetof(hand_shake_v10, length_auth_p_data)] = pack.playload[read_offset];
+                p_hs_pack[offsetof(hand_shake, length_auth_p_data)] = pack.playload[read_offset];
                 read_offset += sizeof(hs_pack.length_auth_p_data);
             }            
             read_offset += sizeof(hs_pack.reserved);
             if(server_capabilities & CLIENT_SECURE_CONNECTION){
                 read_size = hs_pack.length_auth_p_data - sizeof(hs_pack.auth_plugin_data_p1);
-                memcpy(p_hs_pack + offsetof(hand_shake_v10, auth_plugin_data_p2),
+                memcpy(p_hs_pack + offsetof(hand_shake, auth_plugin_data_p2),
                        pack.playload + read_offset,
                        read_size);
                 read_offset += read_size;
@@ -357,27 +389,32 @@ int main(void)
         }else{
             read_size = sizeof(hs_pack.connection_id) + 
                         sizeof(hs_pack.auth_plugin_data_p1);
-            memcpy((p_hs_pack + offsetof(hand_shake_v10, connection_id)), 
+            memcpy((p_hs_pack + offsetof(hand_shake, connection_id)), 
                    (pack.playload + read_offset),
                     read_size);            
         }
         
         
-    }else{                          // handler for handshake protocol v 9
-        //TODO make handler
-        printf("handshake protocol version is %d\n this version of protocol not supported\n", hs_pack.protocol_version);
+    }else{                          // handler for handshake protocol v 9  
+        read_size = GetNullStr(pack.playload + read_offset, &hs_pack.server_version);
+        read_offset += read_size;
+        read_size = sizeof(hs_pack.connection_id);
+        memcpy((p_hs_pack + offsetof(hand_shake, connection_id)), 
+                   (pack.playload + read_offset),
+                    read_size);
+        read_offset += read_size;
+        GetNullStr(pack.playload + read_offset, &hs_pack.auth_plugin_data_full);
     }
 
 
 
     free(pack.playload);
-    memset(&pack, 0, sizeof(pack));
-    memset(&hs_res, 0, sizeof(hs_res));
-    ReadPacket(fd,&pack);
-    
+    memset(&pack, 0, sizeof(pack));    
+    ReadPacket(fd,&pack);    
     int16_t protocol_check = 0;
     memcpy(&protocol_check, pack.playload, sizeof(protocol_check));
     if(protocol_check & CLIENT_PROTOCOL_41){    //Login request(Handshake response v41)        
+
         read_offset = 0;
         read_size = sizeof(hs_res.capability_flags) +
                     sizeof(hs_res.max_packet_size) +
@@ -451,8 +488,23 @@ int main(void)
             }
         }
     }else{ //handler for HandshakeResponse320
-        //TODO make handler to protocol 320
+        read_offset = 0;
+        read_size = sizeof(hs_res_320.capability_flags) +
+                    MAX_PACKET_SIZE_LENGTH;
+        memcpy(p_hs_res_320, pack.playload, read_size);
+        read_offset += read_size;
+        read_offset += GetNullStr(pack.playload, &hs_res_320.username);
+        if(hs_res_320.capability_flags & CLIENT_CONNECT_WITH_DB){
+
+            read_offset += GetNullStr(pack.playload, &hs_res_320.auth_response);
+            read_offset += GetNullStr(pack.playload, &hs_res_320.database);
+        }else{
+            read_size = pack.playload_length - read_offset;
+            hs_res_320.auth_response = Malloc(read_size);
+            memcpy(&hs_res_320.auth_response, pack.playload + read_offset, read_size);
+        }
     }
+
 
     
     //auth switch request
@@ -460,12 +512,8 @@ int main(void)
     ReadPacket(fd, &pack);
     read_offset = 0;
     read_size = 0;
-    struct auth_switch_rq 
-    {   
-        u_char status;
-        u_char *plugin_name;
-        u_char *auth_plugin_data;
-    }as_req_pack;
+    auth_switch_rq as_req_pack;
+    memset(&as_req_pack, 0, sizeof(auth_switch_rq));
     as_req_pack.status = pack.playload[0];
     read_offset += sizeof(as_req_pack.status);
     if(as_req_pack.status == 0xfe && pack.playload_length > read_offset){    //AuthSwitchRequest, OldAuthSwitchRequest length is 1 byte    
@@ -489,8 +537,7 @@ int main(void)
 
     HandshakeV10Free(&hs_pack);
     HSResponseFree(&hs_res);
-    free(as_req_pack.auth_plugin_data);
-    free(as_req_pack.plugin_name);
+    AuthSwitchRqFree(&as_req_pack);
 
     // printf("read result - %d \nstring is %s\n", pack.playload_length, pack.playload);
     // free(pack.playload);    

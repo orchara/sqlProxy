@@ -313,8 +313,7 @@ int main (void)
                     fds[0].events = POLLIN;
 
                     fds[1].fd =  client_fd;
-                    fds[1].events = POLLIN;
-                    // TODO block log file
+                    fds[1].events = POLLIN;                    
                     num_fds = 2;
                     do{
                         fds[0].revents = 0;
