@@ -22,16 +22,27 @@
 #define PACK_RESERVED_OFFSET 5
 #define HSR320_RESERVED_OFFSET 5
 #define MAX_PACKET_SIZE_LENGTH 3
+#define MIN_OK_SIZE 7
+#define OK_HEADER 0x00
+#define ERR_HEADER 0xff
+
+#define SERVER 0    //TODO подумать над дублированием определений
+#define CLIENT 1    //
 
 
 //Capability Flags
 #define CLIENT_PLUGIN_AUTH 0x00080000
 #define CLIENT_SECURE_CONNECTION 0x00008000
-#define CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA 0X00200000
-#define CLIENT_CONNECT_WITH_DB 0X00000008
+#define CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA 0x00200000
+#define CLIENT_CONNECT_WITH_DB 0x00000008
 #define CLIENT_CONNECT_ATTRS 0x00100000
 #define CLIENT_PROTOCOL_41 0x00000200
 #define CLIENT_SSL 0x00000800
+#define CLIENT_TRANSACTIONS 0x00002000
+#define CLIENT_SESSION_TRACK 0x00800000
+
+//status flags
+#define SERVER_SESSION_STATE_CHANGED 0x4000
 
 
 #pragma pack(push, 1)
@@ -119,14 +130,36 @@ typedef struct auth_switch_rq
     u_char *auth_plugin_data;
 }auth_switch_rq;
 
-struct command
-{
+struct command{
     __uint8_t name;
     void *playload;
 };
 
+typedef struct ok_pack{
+    u_int8_t header;
+    u_int64_t affected_rows;
+    u_int64_t last_insert_id;
+    //if capabilities & CLIENT_PROTOCOL_41 
+    // else if capabilities & CLIENT_TRANSACTIONS
+        // use only flags
+    u_int16_t status_flags;
+    u_int16_t warnings;
+    //if capabilities & CLIENT_SESSION_TRACK
+    u_char *info; //lenenc string else EOF string
+        //if status_flags & SERVER_SESSION_STATE_CHANGED
+    u_char *session_state_changes;
 
+}ok_pack;
 
+#pragma pack(push, 1)
+typedef struct err_pack{
+    u_int16_t error_code;
+    //if capabilities & CLIENT_PROTOCOL_41
+    char sql_state_marker;
+    char sql_state[5]; //end if
+    u_char *error_message; //eof string
+}err_pack;
+#pragma pack(pop)
 
 void ReadPacket(int in_fd, sql_packet_bit *pack);
 ssize_t Read(int fd, void *buf, size_t size_buf_element, size_t count);
@@ -140,28 +173,115 @@ struct command ComQueryRead(){
 
 }
 
+
+/*filling the ERR_PACK struct
+PLAYLOAD and PLAYLOAD_LEN is a pointer and length of incoming buffer,
+PACK is a pointer to a ERR_PACK struct instance,
+SRV_CAPABILITIES is a server capabilities flags variable
+*/
+void ReadErr(u_char *playload, u_int32_t playload_len, err_pack *pack, u_int32_t srv_capabilities){
+    memset(pack, 0, sizeof(*pack));
+    int64_t read_size = 0, read_offset = 1; //header exclude from struct but include in playload
+    char *p_pack = (char *)pack;
+    memcpy(p_pack, playload + read_offset, sizeof(pack->error_code));
+    read_offset += sizeof(pack->error_code);
+    if(srv_capabilities & CLIENT_PROTOCOL_41){
+        read_size = sizeof(pack->sql_state_marker) + sizeof(pack->sql_state);
+        memcpy(p_pack + offsetof(err_pack, sql_state_marker), playload + read_offset, read_size);
+        read_offset += read_size;
+    }
+    read_size = playload_len - read_offset;
+    pack->error_message = Malloc(read_size);
+    memcpy(pack->error_message, playload + read_offset, read_size);
+}
+
+/*filling the OK_PACK struct
+PLAYLOAD and PLAYLOAD_LEN is a pointer and length of incoming buffer,
+PACK is a pointer to a OK_PACK struct instance,
+SRV_CAPABILITIES is a server capabilities flags variable
+*/
+void ReadOk(u_char *playload, u_int32_t playload_len, ok_pack *pack, u_int32_t srv_capabilities){
+    for(int i = 0; i < playload_len; ++i){
+        printf("%x ", playload[i]);
+    }
+    
+    memset(pack, 0, sizeof(*pack));
+    int64_t read_size = 0, read_offset = 0;
+    pack->header = playload[0];    
+    read_offset += sizeof(pack->header);
+    read_size = GetLenEncInt(playload+read_offset, &(pack->affected_rows));
+    if(read_size < 0){
+        fprintf(stderr, "lenenc read error to ok_pack.affected_rows\n");
+        return;
+    }    
+    read_offset += read_size;
+    read_size = GetLenEncInt(playload+read_offset, &(pack->last_insert_id));
+    if(read_size < 0){
+        fprintf(stderr, "lenenc read error to ok_pack.last_insert_id\n");
+        return;
+    }    
+    read_offset += read_size;
+    if(srv_capabilities & CLIENT_PROTOCOL_41){
+        read_size = sizeof(pack->status_flags);
+        memcpy(&(pack->status_flags), 
+                 playload + read_offset, 
+                 read_size);
+        read_offset += read_size;
+        read_size = sizeof(pack->warnings);
+        memcpy(&(pack->warnings), 
+                 playload + read_offset, 
+                 read_size);
+        read_offset += read_size;
+    }else if(srv_capabilities & CLIENT_TRANSACTIONS){
+        read_size = sizeof(pack->status_flags);
+        memcpy(&(pack->status_flags), 
+                 playload + read_offset, 
+                 read_size);
+        read_offset += read_size;
+    }
+    if(read_offset < playload_len){ //TODO разобраться с вложенностью строк 
+        if(srv_capabilities & CLIENT_SESSION_TRACK){
+            read_offset += ReadLenIncStr(playload + read_offset, &(pack->info));
+            if((pack->status_flags) & SERVER_SESSION_STATE_CHANGED){
+                read_offset += ReadLenIncStr(playload + read_offset, &(pack->session_state_changes));
+            }
+        }else{
+            read_size = playload_len - read_offset;
+            pack->info = Malloc(read_size);
+            memcpy(&(pack->info), playload + read_offset, read_size);
+        }
+    }
+}
+
 /*read and copy length encoded string from BUF to STR
 *return num of bytes readed from BUF
 */
 u_int64_t ReadLenIncStr(u_char *buf, u_char **str){
     u_int64_t length = 0;
-    u_int64_t offset = 0;
+    int offset = 0;
     offset = GetLenEncInt(buf, &length);
     if(offset < 0){
         fprintf(stderr, "GetLenIncStr error: can't define str length\n");
         return 0;
-    }else{        
-        u_char eos = '\0';
-        *str = Malloc(length + sizeof(char));
-        memcpy(*str, buf+offset, length);
-        memcpy(*str + length, &eos, sizeof(u_char));
-        return offset+length;
+    }else{
+        if(length > 0){        
+            u_char eos = '\0';
+            *str = Malloc(length + sizeof(char));
+            memcpy(*str, buf+offset, length);
+            memcpy(*str + length, &eos, sizeof(u_char));
+            return (u_int64_t)offset + length;
+        }else{
+            u_char mes[] = "string is null length\n";
+            *str = Malloc(sizeof(mes));
+            memcpy(*str, mes, sizeof(mes));
+            return (u_int64_t)offset + length;
+        }
     }
 }
 
 /*read and copy length encoded integer from BUF to RESULT
 *return num of bytes, readed from BUF,
-or -1 if first byte of BUF not in range (0x00 < x < 0xfe)
+or -1 if first byte of BUF not in range (x < 0xfe)
 */
 int GetLenEncInt(u_char *buf, int64_t *result){
     int offset = 0;
@@ -185,7 +305,7 @@ int GetLenEncInt(u_char *buf, int64_t *result){
     return offset;
 }
 
-/*Get data from IN_FD stream and save it to struct SQL_PACKET_BIT 
+/*Get data from IN_FD stream and save it to struct PACK 
 *playload of sql packet stored in mem alocated with malloc, 
 *pointer stored in *SQL_PACKET_BIT::PLAYLOAD
 */
@@ -332,7 +452,7 @@ int main(void)
     memset(&hs_res, 0, sizeof(hs_res));
 
     u_int32_t server_capabilities;
-    u_int64_t read_offset = 0, read_size = 0;
+    int64_t read_offset = 0, read_size = 0;
     
     memset(&pack, 0, sizeof(pack));
     memset(&hs_pack, 0, sizeof(hs_pack));
@@ -411,7 +531,7 @@ int main(void)
     free(pack.playload);
     memset(&pack, 0, sizeof(pack));    
     ReadPacket(fd,&pack);    
-    int16_t protocol_check = 0;
+    u_int16_t protocol_check = 0;
     memcpy(&protocol_check, pack.playload, sizeof(protocol_check));
     if(protocol_check & CLIENT_PROTOCOL_41){    //Login request(Handshake response v41)        
 
@@ -510,10 +630,10 @@ int main(void)
     //auth switch request
     free(pack.playload);
     ReadPacket(fd, &pack);
-    read_offset = 0;
-    read_size = 0;
     auth_switch_rq as_req_pack;
     memset(&as_req_pack, 0, sizeof(auth_switch_rq));
+    read_offset = 0;
+    read_size = 0;        
     as_req_pack.status = pack.playload[0];
     read_offset += sizeof(as_req_pack.status);
     if(as_req_pack.status == 0xfe && pack.playload_length > read_offset){    //AuthSwitchRequest, OldAuthSwitchRequest length is 1 byte    
@@ -523,13 +643,34 @@ int main(void)
         as_req_pack.auth_plugin_data = Malloc(read_size);
         memcpy(as_req_pack.auth_plugin_data, pack.playload +read_offset, read_size);
     }
+    
 
-    //auth switch response
-    free(pack.playload);
-    ReadPacket(fd, &pack);//pack.playload contain encripted password
+    //auth switch response or connection close
+    while(1){ //wait for OK packet or ERR packet
+        free(pack.playload);
+        ReadPacket(fd, &pack);
+        if(pack.sender == SERVER &&
+           pack.playload_length >= MIN_OK_SIZE &&
+           pack.playload[0] == OK_HEADER){
+            ok_pack ok;
+            ReadOk(pack.playload, pack.playload_length, &ok, server_capabilities);
+            //logok(ok);    //TODO make implementation
+            //FreeOK(ok);   //TODO make implementation
+            break;
+        }else if(pack.sender == SERVER &&
+                 pack.playload[0] == ERR_HEADER){
+            err_pack err;
+            ReadErr(pack.playload, pack.playload_length, &err, server_capabilities);  
+            //logerr(err);  //TODO make implementation
+            //FreeErr(err); //TODO make implementation
+            break;
+        }
+        
+    }
 
-    //wait for OK packet or ERR packet
-
+    //фаза коннекта окончена
+        //если ОК - фаза команд
+        //если ЕРР - выход
 
 
     //TODO make a memfree func for all structs
@@ -539,8 +680,7 @@ int main(void)
     HSResponseFree(&hs_res);
     AuthSwitchRqFree(&as_req_pack);
 
-    // printf("read result - %d \nstring is %s\n", pack.playload_length, pack.playload);
-    // free(pack.playload);    
+   
     
 
 
