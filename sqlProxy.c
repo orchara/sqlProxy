@@ -169,8 +169,8 @@ int OpenLogFile(void){
     struct tm *m_time;
     s_time = time(NULL);
     m_time = localtime(&s_time);
-    const char path[] = "./logs/log_%y-%m-%d_%H-%M-%S.txt";
-    //const char path[] = "./logs/test";
+    //const char path[] = "./logs/log_%y-%m-%d_%H-%M-%S.txt";
+    const char path[] = "./logs/test";
     char pathname[(strlen(path)+1)];
     strftime(pathname, (strlen(path)+1), path, m_time);
 
