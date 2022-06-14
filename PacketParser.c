@@ -187,8 +187,8 @@ typedef struct column_definition_41{
 }column_definition_41;
 #pragma pack(pop)
 
-typedef u_char * string;
-typedef string * row;
+typedef u_char* string;
+typedef string* row;
 
 typedef struct resultset_row{
     row this;
@@ -737,28 +737,9 @@ int main(void)
         
     }
     free(pack.playload);
-    //фаза коннекта окончена
-        //если ОК - фаза команд
-        //если ЕРР - выход
 
 
-
-
-   
-    
-
-
-    //фаза команд
-        //принять пакет в буфер
-        //определить отправителя
-        //определить длину, очередь и тело пакета, сохранить в структуру
-            //клиент:
-                //в зависимости от командного бита пихаем тело команды в нужную переменную
-                //пишем команду и время в лог
-            //сервер:
-                //???
-                //
-    
+    ///Command phase
     ReadPacket(fd, &pack);
     if(pack.sender == CLIENT){
         command com;
