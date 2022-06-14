@@ -170,18 +170,19 @@ int OpenLogFile(void){
     s_time = time(NULL);
     m_time = localtime(&s_time);
     //const char path[] = "./logs/log_%y-%m-%d_%H-%M-%S.txt";
-    const char path[] = "./logs/test";
+    const char path[] = "./logs/test1";
     char pathname[(strlen(path)+1)];
     strftime(pathname, (strlen(path)+1), path, m_time);
 
     if(mkdir("./logs", mode) < 0 && (errno != EEXIST)){
-        perror("mkdir");
-        return -1;        
+        perror("OpenLogFile - mkdir()");
+        exit(1);       
     }
     fd = open(pathname, flags, mode);
     if(fd < 0){
-        perror("open log file");
-        return -1;
+        perror("OpenLogFile - open()");
+        fprintf(stderr, "Can't create log file \n");
+        exit(1); 
     }
     return fd;
 }
@@ -205,21 +206,47 @@ void LogWrite(int log_fd, char *buf, int32_t data_size, int8_t sender){
     lockf(log_fd, F_ULOCK, 0);
 }
 
-int main (void)
-{
-    int sock_in_fd, log_fd;
-    pid_t m_pid = getpid();
-    struct sigaction child_sa, quit_sa;
-    sigset_t set;
+/*checking the quit flag*/
+int QuitCheck(sigset_t* set){
+    int result = FALSE;
+    if(pthread_sigmask(SIG_UNBLOCK, set, NULL) == -1){
+        perror("pthread_sigmask");
+        exit(1);
+    }  
+    if(quit_flag){
+        result = TRUE;
+    }
+    if(pthread_sigmask(SIG_BLOCK, set, NULL) == -1){
+        perror("pthread_sigmask");
+        exit(1);
+    }
+    return result;
+}
+
+/*Wrapper for PTHREAD_SIGMASK
+Modify the signal mask for the calling thread. The arguments have
+the same meaning as for sigprocmask(2).*/
+int Pthread_sigmask(int __how, const sigset_t * __restrict__ __newmask, sigset_t * __restrict__ __oldmask){
+    if(pthread_sigmask(__how, __newmask, __oldmask) == -1){
+        perror("pthread_sigmask");
+        exit(1);
+    }
+}
+
+/*setup handlers for signals*/
+void SigSetup(sigset_t* set){
+    struct sigaction child_sa, quit_sa;    
     memset(&quit_sa, 0, sizeof(quit_sa));
-    sigemptyset(&set);
-    sigaddset(&set, SIGCHLD);
-    sigaddset(&set, SIGINT);
+    sigemptyset(set);
+    sigaddset(set, SIGCHLD);
+    sigaddset(set, SIGINT);
     child_sa.sa_handler = SigchldHandler;
-    child_sa.sa_mask = set;
+    child_sa.sa_mask = *set;
     quit_sa.sa_handler = QuitHhandler;
-    quit_sa.sa_mask = set;
-    if(sigaction(SIGINT, &quit_sa, 0) == -1){
+    quit_sa.sa_mask = *set;
+    
+
+    if(sigaction(SIGINT, &quit_sa, NULL) == -1){
         perror("sigaction quit");
         exit(1);
     }
@@ -227,9 +254,19 @@ int main (void)
         perror("sigaction chld");
         exit(1);
     }
+}
+
+int main (void)
+{
+ 
+    int sock_in_fd, log_fd;
+    pid_t m_pid = getpid();
+    sigset_t set;
+    SigSetup(&set);   
+    Pthread_sigmask(SIG_BLOCK, &set, NULL);
     
     sock_in_fd = BindPort(PORT_IN, IN);  
-    printf("sock in fd is %d\n", sock_in_fd); 
+    //printf("sock in fd is %d\n", sock_in_fd); 
     if(sock_in_fd == -1){
         fprintf(stderr, "Server shutting down \n");
         exit(1);
@@ -242,11 +279,8 @@ int main (void)
     }
 
     log_fd = OpenLogFile();
-    if(log_fd < 0){
-        fprintf(stderr, "Can't create log file \n");
-        exit(1); 
-    }
-    while(!quit_flag){        //main awayting connection loop
+
+    while(!QuitCheck(&set)){        //main awayting connection loop
         
         struct pollfd sock_fds;
         int poll_ret = 0, num_fds = 0;  
@@ -259,36 +293,41 @@ int main (void)
         struct sockaddr_storage their_addr;
         socklen_t sin_size = sizeof(their_addr);
 
-        if(pthread_sigmask(SIG_BLOCK, &set, NULL) == -1){
-            perror("pthread_sigmask");
-            exit(1); 
-        }
-
         poll_ret = poll(&sock_fds, num_fds, DELAY);
         if(poll_ret < 0){
             perror("poll() failed");
             exit(1);
-        }else if((poll_ret > 0) && (sock_fds.revents & POLLIN)){ //connection in queue
+        }
+        if((poll_ret > 0) && (sock_fds.revents & POLLIN)){ //connection in queue
             client_fd = accept(sock_in_fd, (struct sockaddr *)&their_addr, &sin_size);
             if(client_fd == -1){
                 close(client_fd);
+                close(sock_in_fd);
+                close(log_fd);
                 perror("accept \n");
                 exit(1);        
             }
-            printf("client fd is %d\n", client_fd);
+            //printf("client fd is %d\n", client_fd);
         
             server_fd = BindPort(PORT_OUT, OUT);
             if(server_fd == -1){
                 close(server_fd);
+                close(client_fd);
+                close(sock_in_fd);
+                close(log_fd);
                 fprintf(stderr, "Could not connect to MySQL server \nServer shutting down \n");
                 exit(1);
             }
-            printf("server fd is %d\n", server_fd);              
+            //printf("server fd is %d\n", server_fd);              
             
             pid_t pid = 1;
             pid = fork();
             if(pid < 0){
                 perror("fork");
+                close(server_fd);
+                close(client_fd);
+                close(sock_in_fd);
+                close(log_fd);
                 exit(1);
             }else if(pid == 0){          //child process  
                 int32_t data_size = 0;
@@ -297,43 +336,31 @@ int main (void)
                 struct pollfd fds[2];
                 close(sock_in_fd); 
                 do{
-                    if(pthread_sigmask(SIG_UNBLOCK, &set, NULL) == -1){
-                        perror("pthread_sigmask");
-                        exit(1);
-                    }  
-                    if(quit_flag){
+                    if(QuitCheck(&set)){
                         break;
                     }
-                    if(pthread_sigmask(SIG_BLOCK, &set, NULL) == -1){
-                        perror("pthread_sigmask");
-                        exit(1);
-                    }
-                    memset(fds, 0, sizeof(fds));
+                    memset(fds, 0, sizeof(fds));                    
                     fds[0].fd =  server_fd;
                     fds[0].events = POLLIN;
-
                     fds[1].fd =  client_fd;
                     fds[1].events = POLLIN;                    
-                    num_fds = 2;
-                    do{
-                        fds[0].revents = 0;
-                        fds[1].revents = 0; 
-                        poll_chk = poll(fds, num_fds, DELAY);
-                        if(poll_chk < 0){
-                            perror("poll() failed");
-                            exit(1);
-                        }else if (poll_chk > 0){
-                            if(fds[0].revents == POLLIN){                                
-                                data_size = ReSend(server_fd, client_fd, &d_buf);
-                                LogWrite(log_fd, d_buf, data_size, SERVER);
-                                free(d_buf);
-                            } else if(fds[1].revents == POLLIN){                                
-                                data_size = ReSend(client_fd, server_fd, &d_buf); 
-                                LogWrite(log_fd, d_buf, data_size, CLIENT);
-                                free(d_buf);
-                            } 
-                        }
-                    }while(poll_chk > 0);
+                    num_fds = 2;                    
+                    fds[0].revents = 0;
+                    fds[1].revents = 0; 
+                    poll_chk = poll(fds, num_fds, DELAY);
+                    if(poll_chk < 0){
+                        perror("poll() failed");
+                        exit(1);
+                    }                    
+                    if(fds[0].revents == POLLIN){                                
+                        data_size = ReSend(server_fd, client_fd, &d_buf);
+                        LogWrite(log_fd, d_buf, data_size, SERVER);
+                        free(d_buf);
+                    } else if(fds[1].revents == POLLIN){                                
+                        data_size = ReSend(client_fd, server_fd, &d_buf); 
+                        LogWrite(log_fd, d_buf, data_size, CLIENT);
+                        free(d_buf);
+                    }
                 }while(data_size > 0);
                 
                 close(client_fd);
@@ -350,11 +377,6 @@ int main (void)
                 while(waitpid(ANY_PID, NULL, WNOHANG) > 0);
                 chld_flag = FALSE; 
             } 
-            
-            if(pthread_sigmask(SIG_UNBLOCK, &set, NULL) == -1){
-                perror("pthread_sigmask");
-                exit(1);
-            }
         } 
     }
     // quit sequence
@@ -363,7 +385,8 @@ int main (void)
         chld = waitpid(ANY_PID, NULL, 0);
         if(chld == -1 && errno & ECHILD){
            break; 
-        }else if(chld == -1){
+        }
+        if(chld == -1){
             perror("on close waitpid");
         }
     }while(chld > 0);
@@ -371,5 +394,4 @@ int main (void)
     close(log_fd);
     printf("socket in fd is closed\n");
     return 0;
-
 }
