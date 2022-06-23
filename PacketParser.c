@@ -497,6 +497,82 @@ void AuthSwitchRqFree(auth_switch_rq *pack){
     free(pack->plugin_name);
 }
 
+
+void HandShakeHandler(sql_packet_bit *pack, u_int32_t *server_capabilities, hand_shake *hs_pack){
+    
+    char *p_hs_pack = (char *)hs_pack;    
+    int64_t read_offset = 0, read_size = 0;        
+                
+    p_hs_pack[offsetof(hand_shake, protocol_version)] = pack->playload[read_offset];                //protocol version
+    read_offset += sizeof(hs_pack->protocol_version);
+    if(hs_pack->protocol_version == HANDSHAKEV10){   // handler for handshake protocol v 10
+        read_size = GetNullStr(pack->playload + read_offset, &(hs_pack->server_version));
+        read_offset += read_size;
+        u_int32_t req_field_length = sizeof(hs_pack->protocol_version) + 
+                                     read_size +       //length of server version
+                                     sizeof(hs_pack->connection_id) + 
+                                     sizeof(hs_pack->auth_plugin_data_p1) + 
+                                     sizeof(hs_pack->filler);
+        if(pack->playload_length > req_field_length)
+        {            
+            read_size = sizeof(hs_pack->connection_id) + 
+                        sizeof(hs_pack->auth_plugin_data_p1) + 
+                        sizeof(hs_pack->filler) +
+                        sizeof(hs_pack->capability_flags_1) +
+                        sizeof(hs_pack->character_set) +
+                        sizeof(hs_pack->status_flags) +
+                        sizeof(hs_pack->capability_flags_2);
+            memcpy((p_hs_pack + offsetof(hand_shake, connection_id)), 
+                   (pack->playload + read_offset),
+                    read_size);
+            read_offset += read_size;            
+            memcpy((char *)server_capabilities, 
+                    p_hs_pack + offsetof(hand_shake,capability_flags_1), 
+                    sizeof(hs_pack->capability_flags_1));
+            memcpy(((char *)server_capabilities) + sizeof(hs_pack->capability_flags_1), 
+                    p_hs_pack + offsetof(hand_shake,capability_flags_2), 
+                    sizeof(hs_pack->capability_flags_2)); 
+            if(*server_capabilities & CLIENT_PLUGIN_AUTH){
+                p_hs_pack[offsetof(hand_shake, length_auth_p_data)] = pack->playload[read_offset];
+                read_offset += sizeof(hs_pack->length_auth_p_data);
+            }            
+            read_offset += sizeof(hs_pack->reserved);
+            if(*server_capabilities & CLIENT_SECURE_CONNECTION){
+                read_size = hs_pack->length_auth_p_data - sizeof(hs_pack->auth_plugin_data_p1);
+                memcpy(p_hs_pack + offsetof(hand_shake, auth_plugin_data_p2),
+                       pack->playload + read_offset,
+                       read_size);
+                read_offset += read_size;
+            }
+            if(*server_capabilities & CLIENT_PLUGIN_AUTH){
+                read_size = pack->playload_length - read_offset;
+                hs_pack->auth_plugin_name = Malloc(read_size);
+                memcpy(hs_pack->auth_plugin_name,
+                       pack->playload + read_offset,
+                       read_size);
+            }
+
+        }else{
+            read_size = sizeof(hs_pack->connection_id) + 
+                        sizeof(hs_pack->auth_plugin_data_p1);
+            memcpy((p_hs_pack + offsetof(hand_shake, connection_id)), 
+                   (pack->playload + read_offset),
+                    read_size);            
+        }
+        
+        
+    }else{                          // handler for handshake protocol v 9  
+        read_size = GetNullStr(pack->playload + read_offset, &(hs_pack->server_version));
+        read_offset += read_size;
+        read_size = sizeof(hs_pack->connection_id);
+        memcpy((p_hs_pack + offsetof(hand_shake, connection_id)), 
+                   (pack->playload + read_offset),
+                    read_size);
+        read_offset += read_size;
+        GetNullStr(pack->playload + read_offset, &(hs_pack->auth_plugin_data_full));
+    }
+}
+
 int main(void)
 {   
     mode_t mode;
@@ -511,91 +587,21 @@ int main(void)
     
     ///login sequence
     sql_packet_bit pack;
-    hand_shake hs_pack;
-    char *p_hs_pack = (char *)&hs_pack;
+    hand_shake hs_pack;    
     hs_response_320 hs_res_320;
-    hs_response_320 *p_hs_res_320 = &hs_res_320;
-    memset(&hs_res_320, 0, sizeof(hs_res_320));
+    hs_response_320 *p_hs_res_320 = &hs_res_320;    
     hs_response_41 hs_res;
     char *p_hs_res = (char *)&hs_res;
-    memset(&hs_res, 0, sizeof(hs_res));
-
     u_int32_t server_capabilities;
     int64_t read_offset = 0, read_size = 0;
-    
+
     memset(&pack, 0, sizeof(pack));
     memset(&hs_pack, 0, sizeof(hs_pack));
-    ReadPacket(fd, &pack);          
-    p_hs_pack[offsetof(hand_shake, protocol_version)] = pack.playload[read_offset];                //protocol version
-    read_offset += sizeof(hs_pack.protocol_version);
-    if(hs_pack.protocol_version == HANDSHAKEV10){   // handler for handshake protocol v 10
-        read_size = GetNullStr(pack.playload + read_offset, &hs_pack.server_version);
-        read_offset += read_size;
-        u_int32_t req_field_length = sizeof(hs_pack.protocol_version) + 
-                                     read_size +       //length of server version
-                                     sizeof(hs_pack.connection_id) + 
-                                     sizeof(hs_pack.auth_plugin_data_p1) + 
-                                     sizeof(hs_pack.filler);
-        if(pack.playload_length > req_field_length)
-        {            
-            read_size = sizeof(hs_pack.connection_id) + 
-                        sizeof(hs_pack.auth_plugin_data_p1) + 
-                        sizeof(hs_pack.filler) +
-                        sizeof(hs_pack.capability_flags_1) +
-                        sizeof(hs_pack.character_set) +
-                        sizeof(hs_pack.status_flags) +
-                        sizeof(hs_pack.capability_flags_2);
-            memcpy((p_hs_pack + offsetof(hand_shake, connection_id)), 
-                   (pack.playload + read_offset),
-                    read_size);
-            read_offset += read_size;            
-            memcpy((char *)&server_capabilities, 
-                    p_hs_pack + offsetof(hand_shake,capability_flags_1), 
-                    sizeof(hs_pack.capability_flags_1));
-            memcpy(((char *)&server_capabilities) + sizeof(hs_pack.capability_flags_1), 
-                    p_hs_pack + offsetof(hand_shake,capability_flags_2), 
-                    sizeof(hs_pack.capability_flags_2)); 
-            if(server_capabilities & CLIENT_PLUGIN_AUTH){
-                p_hs_pack[offsetof(hand_shake, length_auth_p_data)] = pack.playload[read_offset];
-                read_offset += sizeof(hs_pack.length_auth_p_data);
-            }            
-            read_offset += sizeof(hs_pack.reserved);
-            if(server_capabilities & CLIENT_SECURE_CONNECTION){
-                read_size = hs_pack.length_auth_p_data - sizeof(hs_pack.auth_plugin_data_p1);
-                memcpy(p_hs_pack + offsetof(hand_shake, auth_plugin_data_p2),
-                       pack.playload + read_offset,
-                       read_size);
-                read_offset += read_size;
-            }
-            if(server_capabilities & CLIENT_PLUGIN_AUTH){
-                read_size = pack.playload_length - read_offset;
-                hs_pack.auth_plugin_name = Malloc(read_size);
-                memcpy(hs_pack.auth_plugin_name,
-                       pack.playload + read_offset,
-                       read_size);
-            }
+    memset(&hs_res_320, 0, sizeof(hs_res_320));
+    memset(&hs_res, 0, sizeof(hs_res));
+    ReadPacket(fd, &pack);   
 
-        }else{
-            read_size = sizeof(hs_pack.connection_id) + 
-                        sizeof(hs_pack.auth_plugin_data_p1);
-            memcpy((p_hs_pack + offsetof(hand_shake, connection_id)), 
-                   (pack.playload + read_offset),
-                    read_size);            
-        }
-        
-        
-    }else{                          // handler for handshake protocol v 9  
-        read_size = GetNullStr(pack.playload + read_offset, &hs_pack.server_version);
-        read_offset += read_size;
-        read_size = sizeof(hs_pack.connection_id);
-        memcpy((p_hs_pack + offsetof(hand_shake, connection_id)), 
-                   (pack.playload + read_offset),
-                    read_size);
-        read_offset += read_size;
-        GetNullStr(pack.playload + read_offset, &hs_pack.auth_plugin_data_full);
-    }
-
-
+    HandShakeHandler(&pack, &server_capabilities, &hs_pack);
 
     free(pack.playload);
     memset(&pack, 0, sizeof(pack));    
@@ -784,7 +790,7 @@ int main(void)
                     q_res.fields = Malloc(q_res.column_count * sizeof(*q_res.fields));                                       
                     for(int i = 0; i < q_res.column_count; ++i){
                         ReadPacket(fd, &pack);
-                        ReadField(pack.playload, pack.playload_length, &q_res.fields[i]); //TODO make implementation
+                        ReadField(pack.playload, pack.playload_length, &q_res.fields[i]); 
                         free(pack.playload);
                     }
                     if(!(server_capabilities & CLIENT_DEPRECATE_EOF)){ //??? нужен он тут?
