@@ -131,6 +131,11 @@ typedef struct hs_response_320{
 }hs_response_320;
 #pragma pack(pop)
 
+typedef struct hs_response{
+    hs_response_41 *hs_res_41;
+    hs_response_320 *hs_res_320;
+}hs_response;
+
 typedef struct auth_switch_rq 
 {   
     u_int8_t status;
@@ -148,6 +153,7 @@ typedef struct ok_pack{
     u_int64_t affected_rows;
     u_int64_t last_insert_id;
     //if capabilities & CLIENT_PROTOCOL_41 
+        // use flags and warnings
     // else if capabilities & CLIENT_TRANSACTIONS
         // use only flags
     u_int16_t status_flags;
@@ -214,7 +220,9 @@ void ConnAttrsFree(client_conn_attrs *pack);
 void AuthSwitchRqFree(auth_switch_rq *pack);
 
 
-
+/*filling the column definition pack (part of resultset answer from server)
+**PLAYLOAD and PLAYLOAD_LENGTH is a pointer and length of incoming buf
+**PACK is a pointer to empty COLUMN_DEFINITION_41 struct*/
 void ReadField(u_char *playload, u_int32_t playload_length, column_definition_41 *pack){
     u_int64_t read_offset = 0;
     read_offset += ReadLenIncStr(playload + read_offset, &pack->catalog);
@@ -228,11 +236,14 @@ void ReadField(u_char *playload, u_int32_t playload_length, column_definition_41
     //     read_offset += ReadLenIncStr(playload + read_offset, &ptr + (i*(sizeof(u_char*))));
     // }
     read_offset += GetLenEncInt(playload + read_offset, &pack->len_fixlen_fields);
-    int offset = offsetof(column_definition_41, character_set);
     memcpy(ptr + offsetof(column_definition_41, character_set), playload + read_offset, 10);
     return;
 }
 
+/*filling the row struct (part of resultset answer from server)
+**PLAYLOAD is a pointer to incoming buf
+COLUMN_COUNT number of columns in resultset
+**ROW is a pointer to empty row struct*/
 void ReadRow(u_char *playload, u_int64_t column_count, resultset_row *row){
     u_int64_t read_offset = 0;
     row->this = Malloc(column_count * sizeof(*row->this));
@@ -242,7 +253,10 @@ void ReadRow(u_char *playload, u_int64_t column_count, resultset_row *row){
     return;
 }
 
-void ComRead(u_char *playload, u_int32_t playload_len, command *pack){
+/*filling the COMMAND pack struct
+**PLAYLOAD and PLAYLOAD_LEN is a pointer and length of incoming buf
+**PACK is a pointer to empty COMMAND struct*/
+void ReadComm(u_char *playload, u_int32_t playload_len, command *pack){
     memset(pack, 0, sizeof(command));
     pack->id = playload[0];
     pack->playload = Malloc(playload_len - sizeof(pack->id));
@@ -391,6 +405,7 @@ int GetLenEncInt(u_char *buf, int64_t *result){
 *pointer stored in *SQL_PACKET_BIT::PLAYLOAD
 */
 void ReadPacket(int in_fd, sql_packet_bit *pack){
+    memset(pack, 0, sizeof(*pack));
     u_char header[PACKET_HEADER];
     Read(in_fd, header, sizeof(u_char), PACKET_HEADER);
     memcpy(pack, header, PACKET_HEADER);
@@ -497,9 +512,13 @@ void AuthSwitchRqFree(auth_switch_rq *pack){
     free(pack->plugin_name);
 }
 
-
+/*filling the hand_shake struct and server capabilities variable
+**PACK is a pointer to incoming pack struct
+**SERVER_CAPABILITIES is a pointer to empty server capability flags variable
+**HS_RES is a pointer to empty hand_shake struct*/
 void HandShakeHandler(sql_packet_bit *pack, u_int32_t *server_capabilities, hand_shake *hs_pack){
     
+    memset(hs_pack, 0, sizeof(*hs_pack));
     char *p_hs_pack = (char *)hs_pack;    
     int64_t read_offset = 0, read_size = 0;        
                 
@@ -573,6 +592,108 @@ void HandShakeHandler(sql_packet_bit *pack, u_int32_t *server_capabilities, hand
     }
 }
 
+/*filling handshake response struct
+**PACK is a pointer to incoming pack struct
+**HS_RES ias a pointer to empty hs_response struct*/
+void HandShakeResponseHandler(sql_packet_bit *pack, hs_response *hs_res){
+    u_int16_t protocol_check = 0;
+    memset(hs_res, 0, sizeof(hs_response));
+    memcpy(&protocol_check, pack->playload, sizeof(protocol_check));
+    int64_t read_offset = 0, read_size = 0;
+    if(protocol_check & CLIENT_PROTOCOL_41){    //Login request(Handshake response v41)        
+        hs_res->hs_res_41 = Malloc(sizeof(hs_response_41));
+        hs_response_41 *p_hs_res = hs_res->hs_res_41;        
+        read_size = sizeof(p_hs_res->capability_flags) +
+                    sizeof(p_hs_res->max_packet_size) +
+                    sizeof(p_hs_res->character_set);
+        memcpy((char*)p_hs_res + offsetof(hs_response_41, capability_flags), 
+                pack->playload + read_offset,
+                read_size);
+        if(p_hs_res->capability_flags & CLIENT_SSL){   
+            printf("logging with SSL connection not supported\n Please turn of SSL and restart proxy\n");
+            exit(0);
+        }
+        read_offset += read_size;
+        read_offset += sizeof(p_hs_res->reserved);   
+        read_size = GetNullStr((pack->playload + read_offset), &(p_hs_res->username));
+        read_offset += read_size;
+        if(p_hs_res->capability_flags & CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA){
+            int offset = GetLenEncInt(pack->playload + read_offset, &(p_hs_res->len_auth_response));
+            if(offset < 0){
+                char err[] = "Can't define length of auth response\n";
+                p_hs_res->auth_response = Malloc(sizeof(err));
+                strcpy(p_hs_res->auth_response, err);
+            }else{
+                read_offset += offset;
+                p_hs_res->auth_response = Malloc(p_hs_res->len_auth_response);
+                memcpy(p_hs_res->auth_response, (pack->playload + read_offset), p_hs_res->len_auth_response);
+                read_offset += p_hs_res->len_auth_response;
+            }
+        }else if(p_hs_res->capability_flags & CLIENT_SECURE_CONNECTION){
+            p_hs_res->len_auth_response = pack->playload[read_offset];
+            read_offset += sizeof(char);
+            p_hs_res->auth_response = Malloc(p_hs_res->len_auth_response);
+            memcpy(p_hs_res->auth_response, (pack->playload + read_offset), p_hs_res->len_auth_response);
+            read_offset += p_hs_res->len_auth_response;
+        }else{
+            read_size = GetNullStr(pack->playload +read_offset, &(p_hs_res->auth_response));
+            read_offset += read_size;
+        }
+        if(p_hs_res->capability_flags & CLIENT_CONNECT_WITH_DB){       
+            read_size = GetNullStr(pack->playload +read_offset, &(p_hs_res->database));
+            read_offset += read_size;
+        }
+        if(p_hs_res->capability_flags & CLIENT_PLUGIN_AUTH){        
+            read_size = GetNullStr(pack->playload +read_offset, &(p_hs_res->auth_plugin_name));
+            read_offset += read_size;
+        }
+        if(p_hs_res->capability_flags & CLIENT_CONNECT_ATTRS){
+            int offset = GetLenEncInt((pack->playload + read_offset), &(p_hs_res->len_key_values));
+            if(offset < 0){
+                fprintf(stderr, "Handshake response CLIENT_CONNECT_ATTRS\n key-values\nCan't read lenght of all key-values\n");
+            }else{
+                read_offset += offset;
+                for (client_conn_attrs **head = &(p_hs_res->conn_attrs);                         //Read conn atrs pairs from stream
+                    read_offset < pack->playload_length;        //while data in stream
+                    head = &((*head)->next)){
+
+                    *head = Malloc(sizeof(client_conn_attrs));
+                    (*head)->next = NULL;
+                    offset = ReadLenIncStr((pack->playload + read_offset), &((*head)->key));
+                    if(offset < 0){
+                        fprintf(stderr, "Handshake response CLIENT_CONNECT_ATTRS\n key-values\nCan't read key\n");
+                    }else{
+                        read_offset += offset;
+                    }
+                    offset = ReadLenIncStr((pack->playload + read_offset), &((*head)->value));
+                    if(offset < 0){
+                        fprintf(stderr, "Handshake response CLIENT_CONNECT_ATTRS\n key-values\nCan't read value\n");
+                    }else{
+                        read_offset += offset;
+                    }                
+                }
+            }
+        }
+    }else{ //handler for HandshakeResponse320
+        hs_res->hs_res_320 = Malloc(sizeof(hs_response_320));
+        hs_response_320 *p_hs_320 = hs_res->hs_res_320;        
+        read_size = sizeof(p_hs_320->capability_flags) +
+                    MAX_PACKET_SIZE_LENGTH;
+        memcpy((char *)p_hs_320, pack->playload, read_size);
+        read_offset += read_size;
+        read_offset += GetNullStr(pack->playload, &(p_hs_320->username));
+        if(p_hs_320->capability_flags & CLIENT_CONNECT_WITH_DB){
+
+            read_offset += GetNullStr(pack->playload, &(p_hs_320->auth_response));
+            read_offset += GetNullStr(pack->playload, &(p_hs_320->database));
+        }else{
+            read_size = pack->playload_length - read_offset;
+            p_hs_320->auth_response = Malloc(read_size);
+            memcpy(&(p_hs_320->auth_response), pack->playload + read_offset, read_size);
+        }
+    }
+}
+
 int main(void)
 {   
     mode_t mode;
@@ -587,120 +708,22 @@ int main(void)
     
     ///login sequence
     sql_packet_bit pack;
-    hand_shake hs_pack;    
-    hs_response_320 hs_res_320;
-    hs_response_320 *p_hs_res_320 = &hs_res_320;    
-    hs_response_41 hs_res;
-    char *p_hs_res = (char *)&hs_res;
+    hand_shake hs_pack;
+    hs_response hs_response_pack;    
     u_int32_t server_capabilities;
     int64_t read_offset = 0, read_size = 0;
 
     memset(&pack, 0, sizeof(pack));
-    memset(&hs_pack, 0, sizeof(hs_pack));
-    memset(&hs_res_320, 0, sizeof(hs_res_320));
-    memset(&hs_res, 0, sizeof(hs_res));
+    
+    //Initial Handshake Packet 
     ReadPacket(fd, &pack);   
-
     HandShakeHandler(&pack, &server_capabilities, &hs_pack);
 
+    //Handshake Response Packet
     free(pack.playload);
     memset(&pack, 0, sizeof(pack));    
-    ReadPacket(fd,&pack);    
-    u_int16_t protocol_check = 0;
-    memcpy(&protocol_check, pack.playload, sizeof(protocol_check));
-    if(protocol_check & CLIENT_PROTOCOL_41){    //Login request(Handshake response v41)        
-
-        read_offset = 0;
-        read_size = sizeof(hs_res.capability_flags) +
-                    sizeof(hs_res.max_packet_size) +
-                    sizeof(hs_res.character_set);
-        memcpy(p_hs_res + offsetof(hs_response_41, capability_flags), 
-                pack.playload + read_offset,
-                read_size);
-        if(hs_res.capability_flags & CLIENT_SSL){   
-            printf("logging with SSL connection not supported\n Please turn of SSL and restart proxy\n");
-            exit(0);
-        }
-        read_offset += read_size;
-        read_offset += sizeof(hs_res.reserved);   
-        read_size = GetNullStr((pack.playload + read_offset), &hs_res.username);
-        read_offset += read_size;
-        if(hs_res.capability_flags & CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA){
-            int offset = GetLenEncInt(pack.playload + read_offset, &hs_res.len_auth_response);
-            if(offset < 0){
-                char err[] = "Can't define length of auth response\n";
-                hs_res.auth_response = Malloc(sizeof(err));
-                strcpy(hs_res.auth_response, err);
-            }else{
-                read_offset += offset;
-                hs_res.auth_response = Malloc(hs_res.len_auth_response);
-                memcpy(hs_res.auth_response, (pack.playload + read_offset), hs_res.len_auth_response);
-                read_offset += hs_res.len_auth_response;
-            }
-        }else if(hs_res.capability_flags & CLIENT_SECURE_CONNECTION){
-            hs_res.len_auth_response = pack.playload[read_offset];
-            read_offset += sizeof(char);
-            hs_res.auth_response = Malloc(hs_res.len_auth_response);
-            memcpy(hs_res.auth_response, (pack.playload + read_offset), hs_res.len_auth_response);
-            read_offset += hs_res.len_auth_response;
-        }else{
-            read_size = GetNullStr(pack.playload +read_offset, &hs_res.auth_response);
-            read_offset += read_size;
-        }
-        if(hs_res.capability_flags & CLIENT_CONNECT_WITH_DB){       
-            read_size = GetNullStr(pack.playload +read_offset, &hs_res.database);
-            read_offset += read_size;
-        }
-        if(hs_res.capability_flags & CLIENT_PLUGIN_AUTH){        
-            read_size = GetNullStr(pack.playload +read_offset, &hs_res.auth_plugin_name);
-            read_offset += read_size;
-        }
-        if(hs_res.capability_flags & CLIENT_CONNECT_ATTRS){
-            int offset = GetLenEncInt((pack.playload + read_offset), &hs_res.len_key_values);
-            if(offset < 0){
-                fprintf(stderr, "Can't read lenght of all key-values\n");
-            }else{
-                read_offset += offset;
-                for (client_conn_attrs **head = &hs_res.conn_attrs;                         //Read conn atrs pairs from stream
-                    read_offset < pack.playload_length;        //while data in stream
-                    head = &((*head)->next)){
-
-                    *head = Malloc(sizeof(client_conn_attrs));
-                    (*head)->next = NULL;
-                    offset = ReadLenIncStr((pack.playload + read_offset), &((*head)->key));
-                    if(offset < 0){
-                        fprintf(stderr, "Can't read key-values\n");
-                    }else{
-                        read_offset += offset;
-                    }
-                    offset = ReadLenIncStr((pack.playload + read_offset), &((*head)->value));
-                    if(offset < 0){
-                        fprintf(stderr, "Can't read key-values\n");
-                    }else{
-                        read_offset += offset;
-                    }                
-                }
-            }
-        }
-    }else{ //handler for HandshakeResponse320
-        read_offset = 0;
-        read_size = sizeof(hs_res_320.capability_flags) +
-                    MAX_PACKET_SIZE_LENGTH;
-        memcpy(p_hs_res_320, pack.playload, read_size);
-        read_offset += read_size;
-        read_offset += GetNullStr(pack.playload, &hs_res_320.username);
-        if(hs_res_320.capability_flags & CLIENT_CONNECT_WITH_DB){
-
-            read_offset += GetNullStr(pack.playload, &hs_res_320.auth_response);
-            read_offset += GetNullStr(pack.playload, &hs_res_320.database);
-        }else{
-            read_size = pack.playload_length - read_offset;
-            hs_res_320.auth_response = Malloc(read_size);
-            memcpy(&hs_res_320.auth_response, pack.playload + read_offset, read_size);
-        }
-    }
-
-
+    ReadPacket(fd,&pack); 
+    HandShakeResponseHandler(&pack, &hs_response_pack);
     
     //auth switch request
     free(pack.playload);
@@ -749,7 +772,7 @@ int main(void)
     ReadPacket(fd, &pack);
     if(pack.sender == CLIENT){
         command com;
-        ComRead(pack.playload, pack.playload_length, &com);
+        ReadComm(pack.playload, pack.playload_length, &com);
         free(pack.playload);
         if(com.id == COM_QUERY){    //COM_QUERY response handler
             ReadPacket(fd, &pack);
@@ -842,7 +865,6 @@ int main(void)
     
 
     HandshakeV10Free(&hs_pack);
-    HSResponseFree(&hs_res);
     AuthSwitchRqFree(&as_req_pack);
     exit(0);
 }
